@@ -1,0 +1,40 @@
+# --- Secrets and local configuration --------------------------------------
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+secrets/
+
+# --- Go --------------------------------------------------------------------
+bin/
+*.exe
+*.test
+*.out
+coverage.out
+coverage.html
+/backend/channelhunter-api
+/backend/channelhunter-bot
+/backend/channelhunter-worker
+vendor/
+
+# --- Node / Mini App -------------------------------------------------------
+node_modules/
+dist/
+.next/
+.turbo/
+*.tsbuildinfo
+npm-debug.log*
+yarn-error.log*
+.pnpm-debug.log*
+
+# --- Tooling ---------------------------------------------------------------
+.idea/
+.vscode/
+*.swp
+.DS_Store
+
+# --- Local data ------------------------------------------------------------
+tmp/
+*.local
+docker-compose.override.yml

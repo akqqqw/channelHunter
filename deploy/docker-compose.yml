@@ -1,0 +1,137 @@
+# ChannelHunter — local and staging stack.
+#
+#   cp ../.env.example ../.env     # fill in the secrets
+#   cd deploy && docker compose up -d --build
+#
+# Services:
+#   postgres  PostgreSQL 16, data in a named volume (survives restarts)
+#   migrate   one-shot `api --migrate-only` (never drops data)
+#   api       REST API on :8080
+#   bot       Telegram bot (long polling locally, webhook in production)
+#   worker    background jobs / scheduler
+#
+# Each process gets its own image (built from the same source with a different
+# TARGET), so container names, entrypoints and health checks stay predictable.
+
+name: channelhunter
+
+x-db-url: &db-url postgres://${POSTGRES_USER:-channelhunter}:${POSTGRES_PASSWORD:-channelhunter}@postgres:5432/${POSTGRES_DB:-channelhunter}?sslmode=disable
+
+x-backend-env: &backend-env
+  HTTP_HOST: 0.0.0.0
+  HTTP_PORT: "8080"
+  DATABASE_URL: *db-url
+  # The migrate service owns the schema; app processes only verify it.
+  DATABASE_MIGRATE_ON_START: "false"
+  DATABASE_MIGRATIONS_PATH: ""
+
+x-backend: &backend
+  env_file:
+    - ../.env
+  environment: *backend-env
+  restart: unless-stopped
+  depends_on:
+    migrate:
+      condition: service_completed_successfully
+  networks: [backend]
+
+x-healthcheck: &healthcheck
+  interval: 30s
+  timeout: 5s
+  retries: 3
+  start_period: 20s
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-channelhunter}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-channelhunter}
+      POSTGRES_DB: ${POSTGRES_DB:-channelhunter}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    ports:
+      # Localhost only: the database must never be exposed publicly.
+      - "127.0.0.1:${POSTGRES_PORT:-5432}:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-channelhunter} -d ${POSTGRES_DB:-channelhunter}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+    networks: [backend]
+
+  migrate:
+    image: channelhunter-api:${APP_VERSION:-dev}
+    build:
+      context: ../backend
+      dockerfile: Dockerfile
+      args:
+        VERSION: ${APP_VERSION:-dev}
+        TARGET: api
+    entrypoint: ["/app/channelhunter", "--migrate-only"]
+    env_file:
+      - ../.env
+    environment: *backend-env
+    depends_on:
+      postgres:
+        condition: service_healthy
+    # Deliberately not restarted: a failing migration must stay visible.
+    restart: "no"
+    networks: [backend]
+
+  api:
+    <<: *backend
+    container_name: channelhunter-api
+    image: channelhunter-api:${APP_VERSION:-dev}
+    build:
+      context: ../backend
+      dockerfile: Dockerfile
+      args:
+        VERSION: ${APP_VERSION:-dev}
+        TARGET: api
+    ports:
+      - "${API_PORT:-8080}:8080"
+    healthcheck:
+      <<: *healthcheck
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1:8080/ready"]
+
+  bot:
+    <<: *backend
+    container_name: channelhunter-bot
+    image: channelhunter-bot:${APP_VERSION:-dev}
+    build:
+      context: ../backend
+      dockerfile: Dockerfile
+      args:
+        VERSION: ${APP_VERSION:-dev}
+        TARGET: bot
+    # The bot only exposes probes; it is not reachable from outside.
+    expose: ["8080"]
+    healthcheck:
+      <<: *healthcheck
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1:8080/health"]
+
+  worker:
+    <<: *backend
+    container_name: channelhunter-worker
+    image: channelhunter-worker:${APP_VERSION:-dev}
+    build:
+      context: ../backend
+      dockerfile: Dockerfile
+      args:
+        VERSION: ${APP_VERSION:-dev}
+        TARGET: worker
+    expose: ["8080"]
+    healthcheck:
+      <<: *healthcheck
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1:8080/ready"]
+
+networks:
+  backend:
+    driver: bridge
+
+volumes:
+  postgres_data:
+    driver: local

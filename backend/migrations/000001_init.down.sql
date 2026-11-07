@@ -1,0 +1,22 @@
+-- Reverts 000001_init.up.sql.
+DROP TABLE IF EXISTS audit_logs;
+DROP TABLE IF EXISTS payment_transactions;
+DROP TABLE IF EXISTS notifications;
+DROP TABLE IF EXISTS tracked_channels;
+DROP TABLE IF EXISTS campaign_metrics;
+DROP TABLE IF EXISTS campaigns;
+DROP TABLE IF EXISTS advertisers;
+DROP TABLE IF EXISTS post_snapshots;
+DROP TABLE IF EXISTS channel_posts;
+DROP TABLE IF EXISTS channel_snapshots;
+DROP TABLE IF EXISTS data_imports;
+DROP TABLE IF EXISTS data_sources;
+DROP TABLE IF EXISTS workspace_channels;
+DROP TABLE IF EXISTS channels;
+DROP TABLE IF EXISTS subscriptions;
+DROP TABLE IF EXISTS plans;
+DROP TABLE IF EXISTS workspace_members;
+DROP TABLE IF EXISTS workspaces;
+DROP TABLE IF EXISTS users;
+DROP FUNCTION IF EXISTS prevent_mutation();
+DROP FUNCTION IF EXISTS set_updated_at();

@@ -1,0 +1,78 @@
+# golangci-lint configuration for the ChannelHunter backend.
+# Run with: make lint  (or golangci-lint run ./... inside backend/)
+version: "2"
+
+run:
+  timeout: 5m
+  tests: true
+
+output:
+  formats:
+    text:
+      path: stdout
+
+linters:
+  default: standard
+  enable:
+    - bodyclose        # leaked HTTP response bodies
+    - copyloopvar      # loop variable capture (Go < 1.22 style bugs)
+    - errorlint        # errors.Is/As instead of == / type assertions
+    - gocritic
+    - gosec            # security smells (weak crypto, bad file permissions)
+    - misspell
+    - nilerr           # returning nil after a non-nil error
+    - noctx            # HTTP requests without context
+    - revive
+    - rowserrcheck     # unchecked rows.Err()
+    - sqlclosecheck    # unclosed rows/statements
+    - unconvert
+    - unparam
+    - unused
+    - wrapcheck        # wrap errors crossing package boundaries
+  disable:
+    - depguard
+    - exhaustruct
+    - varnamelen
+    - funlen
+    - cyclop
+
+  settings:
+    errcheck:
+      check-type-assertions: true
+    gosec:
+      excludes:
+        - G404 # math/rand is only used for jitter, not for secrets
+    revive:
+      rules:
+        - name: exported
+          disabled: false
+        - name: package-comments
+          disabled: false
+        - name: var-naming
+        - name: indent-error-flow
+        - name: errorf
+        - name: context-as-argument
+        - name: error-return
+        - name: error-strings
+    wrapcheck:
+      ignore-sigs:
+        - .Errorf(
+        - errors.New(
+        - errors.Join(
+        - .Wrap(
+        - apierror.
+      ignore-package-globs:
+        - github.com/akqqqw/channelhunter/backend/*
+
+formatters:
+  enable:
+    - gofmt
+    - goimports
+  settings:
+    goimports:
+      local-prefixes:
+        - github.com/akqqqw/channelhunter/backend
+
+issues:
+  max-issues-per-linter: 0
+  max-same-issues: 0

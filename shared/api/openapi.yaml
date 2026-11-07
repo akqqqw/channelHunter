@@ -1,0 +1,935 @@
+openapi: 3.1.0
+info:
+  title: ChannelHunter API
+  version: 0.1.0
+  description: |
+    Единый REST API для Telegram-бота и будущего Mini App.
+
+    ## Статус
+    Реализованы (этап 1): `/health`, `/ready`, `/api/v1/meta`.
+    Остальные маршруты зафиксированы контрактом и добавляются по этапам;
+    до реализации они возвращают стандартную ошибку `NOT_FOUND`.
+
+    ## Соглашения
+    * Деньги передаются строкой (`"1490.00"`), чтобы избежать потерь точности.
+    * Неизвестные показатели — `null`, никогда не `0`.
+    * Каждый ответ содержит `X-Request-ID`.
+  license:
+    name: Proprietary
+
+servers:
+  - url: http://localhost:8080
+    description: Локальная разработка
+  - url: https://api.channelhunter.example.com
+    description: Production (пример)
+
+tags:
+  - name: system
+    description: Служебные endpoint'ы
+  - name: auth
+  - name: workspaces
+  - name: channels
+  - name: analytics
+  - name: campaigns
+  - name: imports
+  - name: billing
+  - name: reports
+
+security:
+  - bearerAuth: []
+  - telegramInitData: []
+
+paths:
+  /health:
+    get:
+      tags: [system]
+      summary: Liveness probe
+      description: |
+        Проверяет только то, что процесс жив и отвечает. Зависимости (БД,
+        провайдеры) не опрашиваются: медленная база не должна вызывать
+        перезапуск контейнера.
+      security: []
+      responses:
+        "200":
+          description: Процесс работает
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [status, service, process, version]
+                properties:
+                  status: { type: string, enum: [ok] }
+                  service: { type: string, example: channelhunter }
+                  process: { type: string, enum: [api, bot, worker] }
+                  version: { type: string, example: v0.1.0 }
+                  uptime: { type: string, example: 3h12m4s }
+                  time: { type: string, format: date-time }
+
+  /ready:
+    get:
+      tags: [system]
+      summary: Readiness probe
+      description: |
+        Опрашивает зависимости параллельно с таймаутом на каждую.
+        Если критичная зависимость недоступна — `503`.
+      security: []
+      responses:
+        "200":
+          description: Готов обслуживать запросы
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/HealthReport" }
+        "503":
+          description: Критичная зависимость недоступна
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/HealthReport" }
+
+  /api/v1/meta:
+    get:
+      tags: [system]
+      summary: Метаданные сервиса
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  service: { type: string }
+                  version: { type: string }
+                  environment: { type: string, enum: [development, staging, production] }
+                  api_version: { type: string, example: v1 }
+                  time: { type: string, format: date-time }
+        "429":
+          $ref: "#/components/responses/RateLimited"
+
+  # ---------------------------------------------------------------------------
+  # Этап 2: аутентификация и рабочие пространства
+  # ---------------------------------------------------------------------------
+  /api/v1/auth/telegram:
+    post:
+      tags: [auth]
+      summary: Авторизация через Telegram
+      description: |
+        Принимает `initData` из Telegram Mini App и проверяет подпись на
+        backend (HMAC-SHA256 с токеном бота). Telegram ID из тела запроса не
+        принимается: личность подтверждается только подписью.
+
+        Для бота этот маршрут не нужен — бот получает обновления от Telegram
+        напрямую и создаёт пользователя на сервере.
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [init_data]
+              additionalProperties: false
+              properties:
+                init_data:
+                  type: string
+                  description: Строка initData из Telegram.WebApp.initData
+                  maxLength: 8192
+                workspace_id:
+                  type: string
+                  format: uuid
+                  description: Выбранное рабочее пространство (необязательно)
+      responses:
+        "200":
+          description: Сессия создана
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  token: { type: string }
+                  expires_at: { type: string, format: date-time }
+                  user: { $ref: "#/components/schemas/User" }
+                  workspaces:
+                    type: array
+                    items: { $ref: "#/components/schemas/Workspace" }
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "422":
+          $ref: "#/components/responses/ValidationError"
+        "429":
+          $ref: "#/components/responses/RateLimited"
+
+  /api/v1/me:
+    get:
+      tags: [auth]
+      summary: Профиль текущего пользователя
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  user: { $ref: "#/components/schemas/User" }
+                  workspaces:
+                    type: array
+                    items: { $ref: "#/components/schemas/Workspace" }
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+
+  /api/v1/workspaces:
+    get:
+      tags: [workspaces]
+      summary: Рабочие пространства пользователя
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  data:
+                    type: array
+                    items: { $ref: "#/components/schemas/Workspace" }
+                  meta: { $ref: "#/components/schemas/Meta" }
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+
+  # ---------------------------------------------------------------------------
+  # Этап 3–4: каналы и аналитика
+  # ---------------------------------------------------------------------------
+  /api/v1/channels:
+    get:
+      tags: [channels]
+      summary: Каналы рабочего пространства
+      parameters:
+        - $ref: "#/components/parameters/WorkspaceHeader"
+        - name: limit
+          in: query
+          schema: { type: integer, minimum: 1, maximum: 100, default: 20 }
+        - name: offset
+          in: query
+          schema: { type: integer, minimum: 0, default: 0 }
+        - name: archived
+          in: query
+          schema: { type: boolean, default: false }
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  data:
+                    type: array
+                    items: { $ref: "#/components/schemas/ChannelCard" }
+                  meta: { $ref: "#/components/schemas/Meta" }
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+    post:
+      tags: [channels]
+      summary: Добавить канал
+      description: |
+        Принимает `@username`, ссылку `t.me/…` или Telegram ID.
+        Проверяет дубликаты в общем каталоге и лимит каналов тарифа
+        (`PLAN_LIMIT_EXCEEDED`).
+      parameters:
+        - $ref: "#/components/parameters/WorkspaceHeader"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              required: [reference]
+              properties:
+                reference:
+                  type: string
+                  description: "@username, https://t.me/username или числовой ID"
+                  maxLength: 256
+                category: { type: string, maxLength: 64 }
+                access_level:
+                  type: string
+                  enum: [public, owner_access]
+                  default: public
+      responses:
+        "201":
+          description: Канал добавлен
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ChannelCard" }
+        "402":
+          $ref: "#/components/responses/PlanLimit"
+        "409":
+          description: Канал уже добавлен в это рабочее пространство
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+        "422":
+          $ref: "#/components/responses/ValidationError"
+
+  /api/v1/channels/{id}:
+    get:
+      tags: [channels]
+      summary: Карточка канала
+      parameters:
+        - $ref: "#/components/parameters/WorkspaceHeader"
+        - name: id
+          in: path
+          required: true
+          schema: { type: string, format: uuid }
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ChannelCard" }
+        "404":
+          $ref: "#/components/responses/NotFound"
+
+  /api/v1/channels/{id}/metrics:
+    get:
+      tags: [analytics]
+      summary: Показатели канала за период
+      parameters:
+        - $ref: "#/components/parameters/WorkspaceHeader"
+        - name: id
+          in: path
+          required: true
+          schema: { type: string, format: uuid }
+        - name: period
+          in: query
+          schema: { type: string, enum: [7d, 30d, 90d, 365d], default: 30d }
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ChannelMetricsResponse" }
+        "402":
+          $ref: "#/components/responses/PlanLimit"
+        "404":
+          $ref: "#/components/responses/NotFound"
+
+  /api/v1/channels/{id}/refresh:
+    post:
+      tags: [analytics]
+      summary: Запросить обновление данных
+      description: |
+        Ставит задачу в очередь. Частота ограничена лимитами провайдера и
+        настройкой мониторинга тарифа.
+      parameters:
+        - $ref: "#/components/parameters/WorkspaceHeader"
+        - name: id
+          in: path
+          required: true
+          schema: { type: string, format: uuid }
+      responses:
+        "202":
+          description: Задача принята
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  job_id: { type: string, format: uuid }
+                  scheduled_at: { type: string, format: date-time }
+        "429":
+          $ref: "#/components/responses/RateLimited"
+
+  /api/v1/channels/compare:
+    post:
+      tags: [analytics]
+      summary: Сравнение каналов
+      parameters:
+        - $ref: "#/components/parameters/WorkspaceHeader"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              required: [channel_ids]
+              properties:
+                channel_ids:
+                  type: array
+                  minItems: 2
+                  maxItems: 10
+                  items: { type: string, format: uuid }
+                period:
+                  type: string
+                  enum: [7d, 30d, 90d, 365d]
+                  default: 30d
+                sort_by:
+                  type: string
+                  enum: [subscribers, growth, average_views, err, cpm, post_frequency, confidence]
+                  default: subscribers
+                sort_order:
+                  type: string
+                  enum: [asc, desc]
+                  default: desc
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  period: { $ref: "#/components/schemas/Period" }
+                  items:
+                    type: array
+                    items: { $ref: "#/components/schemas/ChannelComparison" }
+        "402":
+          $ref: "#/components/responses/PlanLimit"
+        "422":
+          $ref: "#/components/responses/ValidationError"
+
+  # ---------------------------------------------------------------------------
+  # Этап 5: рекламные кампании
+  # ---------------------------------------------------------------------------
+  /api/v1/campaigns:
+    get:
+      tags: [campaigns]
+      summary: Кампании
+      parameters:
+        - $ref: "#/components/parameters/WorkspaceHeader"
+        - name: status
+          in: query
+          schema: { type: string, enum: [draft, planned, running, completed, cancelled] }
+        - name: channel_id
+          in: query
+          schema: { type: string, format: uuid }
+        - name: limit
+          in: query
+          schema: { type: integer, minimum: 1, maximum: 100, default: 20 }
+        - name: offset
+          in: query
+          schema: { type: integer, minimum: 0, default: 0 }
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  data:
+                    type: array
+                    items: { $ref: "#/components/schemas/Campaign" }
+                  meta: { $ref: "#/components/schemas/Meta" }
+    post:
+      tags: [campaigns]
+      summary: Создать кампанию
+      parameters:
+        - $ref: "#/components/parameters/WorkspaceHeader"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/CampaignInput" }
+      responses:
+        "201":
+          description: Создана
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Campaign" }
+        "402":
+          $ref: "#/components/responses/PlanLimit"
+        "422":
+          $ref: "#/components/responses/ValidationError"
+
+  /api/v1/campaigns/{id}:
+    get:
+      tags: [campaigns]
+      summary: Кампания с расчётом эффективности
+      parameters:
+        - $ref: "#/components/parameters/WorkspaceHeader"
+        - name: id
+          in: path
+          required: true
+          schema: { type: string, format: uuid }
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/CampaignDetail" }
+        "404":
+          $ref: "#/components/responses/NotFound"
+
+  /api/v1/campaigns/{id}/metrics:
+    post:
+      tags: [campaigns]
+      summary: Добавить результаты размещения
+      parameters:
+        - $ref: "#/components/parameters/WorkspaceHeader"
+        - name: id
+          in: path
+          required: true
+          schema: { type: string, format: uuid }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              properties:
+                views: { type: integer, minimum: 0, nullable: true }
+                clicks: { type: integer, minimum: 0, nullable: true }
+                new_subscribers: { type: integer, minimum: 0, nullable: true }
+                spend: { type: string, nullable: true, example: "15000.00" }
+                captured_at: { type: string, format: date-time }
+      responses:
+        "201":
+          description: Метрика добавлена
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/CampaignMetrics" }
+        "422":
+          $ref: "#/components/responses/ValidationError"
+
+  # ---------------------------------------------------------------------------
+  # Этапы 4, 6, 7
+  # ---------------------------------------------------------------------------
+  /api/v1/imports:
+    post:
+      tags: [imports]
+      summary: Загрузить CSV/XLSX
+      parameters:
+        - $ref: "#/components/parameters/WorkspaceHeader"
+      requestBody:
+        required: true
+        content:
+          multipart/form-data:
+            schema:
+              type: object
+              required: [file]
+              properties:
+                file:
+                  type: string
+                  format: binary
+                  description: CSV или XLSX, не больше MAX_UPLOAD_BYTES
+                channel_id:
+                  type: string
+                  format: uuid
+      responses:
+        "202":
+          description: Файл принят в обработку
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  import_id: { type: string, format: uuid }
+                  status: { type: string, enum: [pending, processing, completed, failed] }
+        "413":
+          description: Файл слишком большой
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+        "422":
+          $ref: "#/components/responses/ValidationError"
+
+  /api/v1/subscription:
+    get:
+      tags: [billing]
+      summary: Текущий тариф и лимиты
+      parameters:
+        - $ref: "#/components/parameters/WorkspaceHeader"
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Subscription" }
+
+  /api/v1/payments:
+    post:
+      tags: [billing]
+      summary: Создать платёж
+      parameters:
+        - $ref: "#/components/parameters/WorkspaceHeader"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              required: [plan_code]
+              properties:
+                plan_code: { type: string, enum: [pro, business] }
+                idempotency_key: { type: string, maxLength: 128 }
+      responses:
+        "201":
+          description: Платёж создан
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  payment_id: { type: string }
+                  status: { type: string, enum: [pending, succeeded, failed, refunded, cancelled] }
+                  confirmation_url: { type: string, nullable: true }
+        "409":
+          description: Платёж с таким idempotency_key уже существует
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+
+  /api/v1/reports/{id}:
+    get:
+      tags: [reports]
+      summary: Отчёт
+      parameters:
+        - $ref: "#/components/parameters/WorkspaceHeader"
+        - name: id
+          in: path
+          required: true
+          schema: { type: string, format: uuid }
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Report" }
+        "404":
+          $ref: "#/components/responses/NotFound"
+
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+      description: Токен, выданный POST /api/v1/auth/telegram
+    telegramInitData:
+      type: apiKey
+      in: header
+      name: X-Telegram-Init-Data
+      description: |
+        Сырая строка initData из Mini App. Проверяется на backend по подписи
+        (HMAC-SHA256 с токеном бота) и сроку жизни auth_date.
+
+  parameters:
+    WorkspaceHeader:
+      name: X-Workspace-Id
+      in: header
+      required: false
+      description: Активное рабочее пространство. Если не указано, используется пространство по умолчанию.
+      schema: { type: string, format: uuid }
+
+  responses:
+    Unauthorized:
+      description: Требуется авторизация
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/Error" }
+    NotFound:
+      description: Ресурс не найден
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/Error" }
+    ValidationError:
+      description: Ошибка валидации
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/Error" }
+    PlanLimit:
+      description: Лимит тарифа исчерпан
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/Error" }
+    RateLimited:
+      description: Слишком много запросов
+      headers:
+        Retry-After:
+          schema: { type: integer }
+          description: Секунд до следующей попытки
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/Error" }
+
+  schemas:
+    Error:
+      type: object
+      required: [error]
+      properties:
+        error:
+          type: object
+          required: [code, message, request_id]
+          properties:
+            code:
+              type: string
+              enum:
+                - BAD_REQUEST
+                - VALIDATION_ERROR
+                - UNAUTHORIZED
+                - FORBIDDEN
+                - NOT_FOUND
+                - CONFLICT
+                - RATE_LIMITED
+                - PLAN_LIMIT_EXCEEDED
+                - UNSUPPORTED
+                - UNAVAILABLE
+                - UPSTREAM_ERROR
+                - PAYLOAD_TOO_LARGE
+                - INTERNAL_ERROR
+                - NOT_IMPLEMENTED
+                - INVARIANT_VIOLATION
+            message: { type: string }
+            request_id: { type: string }
+            details:
+              type: array
+              items:
+                type: object
+                properties:
+                  field: { type: string }
+                  message: { type: string }
+
+    Meta:
+      type: object
+      properties:
+        total: { type: integer }
+        limit: { type: integer }
+        offset: { type: integer }
+
+    Period:
+      type: object
+      properties:
+        from: { type: string, format: date-time }
+        to: { type: string, format: date-time }
+        days: { type: integer }
+
+    HealthReport:
+      type: object
+      properties:
+        status: { type: string, enum: [ok, degraded, down] }
+        service: { type: string }
+        process: { type: string }
+        version: { type: string }
+        environment: { type: string }
+        uptime: { type: string }
+        time: { type: string, format: date-time }
+        dependencies:
+          type: object
+          additionalProperties:
+            type: object
+            properties:
+              status: { type: string, enum: [ok, degraded, down] }
+              critical: { type: boolean }
+              latency_ms: { type: number }
+              error: { type: string }
+              checked_at: { type: string, format: date-time }
+
+    User:
+      type: object
+      properties:
+        id: { type: string, format: uuid }
+        telegram_id: { type: integer, format: int64 }
+        username: { type: string, nullable: true }
+        first_name: { type: string, nullable: true }
+        last_name: { type: string, nullable: true }
+        language_code: { type: string }
+
+    Workspace:
+      type: object
+      properties:
+        id: { type: string, format: uuid }
+        name: { type: string }
+        role: { type: string, enum: [owner, admin, analyst, viewer] }
+        plan_code: { type: string, enum: [free, pro, business] }
+        limits:
+          type: object
+          properties:
+            max_channels: { type: integer }
+            history_days: { type: integer }
+            max_members: { type: integer }
+
+    DataProvenance:
+      type: object
+      description: Происхождение значения — обязательная часть любого показателя.
+      properties:
+        code:
+          type: string
+          nullable: true
+          description: Код источника из data_sources (telegram_bot_api, provider_api, csv_import, manual_entry)
+        confidence:
+          type: string
+          enum: [verified, estimated, unverified, unavailable]
+        captured_at: { type: string, format: date-time, nullable: true }
+        period_start: { type: string, format: date-time, nullable: true }
+        period_end: { type: string, format: date-time, nullable: true }
+
+    ChannelCard:
+      type: object
+      properties:
+        id: { type: string, format: uuid }
+        username: { type: string }
+        title: { type: string }
+        description: { type: string, nullable: true }
+        category: { type: string, nullable: true }
+        access_level: { type: string, enum: [public, owner_access] }
+        subscribers: { type: integer, format: int64, nullable: true }
+        average_views: { type: integer, format: int64, nullable: true }
+        err: { type: number, nullable: true }
+        post_frequency: { type: number, nullable: true }
+        provenance:
+          type: object
+          additionalProperties: { $ref: "#/components/schemas/DataProvenance" }
+        last_refreshed_at: { type: string, format: date-time, nullable: true }
+        unavailable:
+          type: array
+          description: Показатели, которые источник физически не может предоставить.
+          items: { type: string }
+
+    ChannelMetricsResponse:
+      type: object
+      properties:
+        channel_id: { type: string, format: uuid }
+        period: { $ref: "#/components/schemas/Period" }
+        metrics:
+          type: object
+          properties:
+            subscribers: { type: integer, nullable: true }
+            growth: { type: integer, nullable: true }
+            views: { type: integer, nullable: true }
+            average_views: { type: integer, nullable: true }
+            err: { type: number, nullable: true }
+            post_frequency: { type: number, nullable: true }
+            cpm: { type: number, nullable: true }
+            cpc: { type: number, nullable: true }
+            cpf: { type: number, nullable: true }
+        sources:
+          type: object
+          additionalProperties: { $ref: "#/components/schemas/DataProvenance" }
+        series:
+          type: array
+          description: Точки для графика (динамика подписчиков/охватов).
+          items:
+            type: object
+            properties:
+              captured_at: { type: string, format: date-time }
+              subscribers: { type: integer, nullable: true }
+              average_views: { type: integer, nullable: true }
+
+    ChannelComparison:
+      type: object
+      properties:
+        channel_id: { type: string, format: uuid }
+        username: { type: string }
+        title: { type: string }
+        subscribers: { type: integer, nullable: true }
+        growth: { type: integer, nullable: true }
+        average_views: { type: integer, nullable: true }
+        err: { type: number, nullable: true }
+        ad_cost: { type: string, nullable: true }
+        cpm: { type: number, nullable: true }
+        post_frequency: { type: number, nullable: true }
+        confidence: { type: string, enum: [verified, estimated, unverified, unavailable] }
+
+    CampaignInput:
+      type: object
+      additionalProperties: false
+      required: [name]
+      properties:
+        name: { type: string, maxLength: 200 }
+        advertiser_id: { type: string, format: uuid, nullable: true }
+        channel_id: { type: string, format: uuid, nullable: true }
+        budget: { type: string, nullable: true, example: "50000.00" }
+        cost: { type: string, nullable: true, example: "15000.00" }
+        currency: { type: string, default: RUB }
+        scheduled_at: { type: string, format: date-time, nullable: true }
+        post_url: { type: string, nullable: true }
+        comment: { type: string, nullable: true }
+
+    Campaign:
+      type: object
+      properties:
+        id: { type: string, format: uuid }
+        name: { type: string }
+        status: { type: string, enum: [draft, planned, running, completed, cancelled] }
+        channel_id: { type: string, format: uuid, nullable: true }
+        advertiser_id: { type: string, format: uuid, nullable: true }
+        budget: { type: string, nullable: true }
+        cost: { type: string, nullable: true }
+        revenue: { type: string, nullable: true }
+        currency: { type: string }
+        scheduled_at: { type: string, format: date-time, nullable: true }
+        post_url: { type: string, nullable: true }
+        comment: { type: string, nullable: true }
+        created_at: { type: string, format: date-time }
+        updated_at: { type: string, format: date-time }
+
+    CampaignMetrics:
+      type: object
+      properties:
+        views: { type: integer, nullable: true }
+        clicks: { type: integer, nullable: true }
+        new_subscribers: { type: integer, nullable: true }
+        spend: { type: string, nullable: true }
+        cpm: { type: number, nullable: true }
+        cpc: { type: number, nullable: true }
+        cpf: { type: number, nullable: true }
+        confidence: { type: string, enum: [verified, estimated, unverified, unavailable] }
+
+    CampaignDetail:
+      allOf:
+        - $ref: "#/components/schemas/Campaign"
+        - type: object
+          properties:
+            metrics: { $ref: "#/components/schemas/CampaignMetrics" }
+            history:
+              type: array
+              items:
+                type: object
+                properties:
+                  captured_at: { type: string, format: date-time }
+                  views: { type: integer, nullable: true }
+                  clicks: { type: integer, nullable: true }
+                  new_subscribers: { type: integer, nullable: true }
+
+    Subscription:
+      type: object
+      properties:
+        plan_code: { type: string }
+        plan_name: { type: string }
+        status: { type: string, enum: [trialing, active, past_due, cancelled, expired] }
+        current_period_end: { type: string, format: date-time, nullable: true }
+        price_monthly: { type: string }
+        currency: { type: string }
+        usage:
+          type: object
+          properties:
+            channels: { type: integer }
+            members: { type: integer }
+            campaigns: { type: integer }
+        limits:
+          type: object
+          properties:
+            max_channels: { type: integer }
+            history_days: { type: integer }
+            max_members: { type: integer }
+            max_campaigns: { type: integer }
+        features:
+          type: object
+          additionalProperties: { type: boolean }
+
+    Report:
+      type: object
+      properties:
+        id: { type: string, format: uuid }
+        channel_id: { type: string, format: uuid }
+        period: { $ref: "#/components/schemas/Period" }
+        generated_at: { type: string, format: date-time }
+        format: { type: string, enum: [json, csv] }
+        download_url: { type: string, nullable: true }
+        payload:
+          type: object
+          additionalProperties: true
